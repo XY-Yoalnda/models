@@ -50,32 +50,14 @@ flags.DEFINE_boolean('faces_only', True, 'If True, generates bounding boxes '
                      'for pet faces.  Otherwise generates bounding boxes (as '
                      'well as segmentations for full pet bodies).  Note that '
                      'in the latter case, the resulting files are much larger.')
-flags.DEFINE_string('mask_type', 'png', 'How to represent instance '
-                    'segmentation masks. Options are "png" or "numerical".')
 FLAGS = flags.FLAGS
-
-
-def get_class_name_from_filename(file_name):
-  """Gets the class name from a file.
-
-  Args:
-    file_name: The file name to get the class name from.
-               ie. "american_pit_bull_terrier_105.jpg"
-
-  Returns:
-    A string of the class name.
-  """
-  match = re.match(r'([A-Za-z_]+)(_[0-9]+\.jpg)', file_name, re.I)
-  return match.groups()[0]
 
 
 def dict_to_tf_example(data,
                        mask_path,
                        label_map_dict,
                        image_subdirectory,
-                       ignore_difficult_instances=False,
-                       faces_only=True,
-                       mask_type='png'):
+                       ignore_difficult_instances=False):
   """Convert XML derived dict to tf.Example proto.
 
   Notice that this function normalizes the bounding box coordinates provided
@@ -92,8 +74,6 @@ def dict_to_tf_example(data,
       dataset  (default: False).
     faces_only: If True, generates bounding boxes for pet faces.  Otherwise
       generates bounding boxes (as well as segmentations for full pet bodies).
-    mask_type: 'numerical' or 'png'. 'png' is recommended because it leads to
-      smaller file sizes.
 
   Returns:
     example: The converted tf.Example.
@@ -109,19 +89,6 @@ def dict_to_tf_example(data,
   if image.format != 'JPEG':
     raise ValueError('Image format not JPEG')
   key = hashlib.sha256(encoded_jpg).hexdigest()
-
-  with tf.gfile.GFile(mask_path, 'rb') as fid:
-    encoded_mask_png = fid.read()
-  encoded_png_io = io.BytesIO(encoded_mask_png)
-  mask = PIL.Image.open(encoded_png_io)
-  if mask.format != 'PNG':
-    raise ValueError('Mask format not PNG')
-
-  mask_np = np.asarray(mask)
-  nonbackground_indices_x = np.any(mask_np != 2, axis=0)
-  nonbackground_indices_y = np.any(mask_np != 2, axis=1)
-  nonzero_x_indices = np.where(nonbackground_indices_x)
-  nonzero_y_indices = np.where(nonbackground_indices_y)
 
   width = int(data['size']['width'])
   height = int(data['size']['height'])
@@ -142,29 +109,20 @@ def dict_to_tf_example(data,
       continue
     difficult_obj.append(int(difficult))
 
-    if faces_only:
-      xmin = float(obj['bndbox']['xmin'])
-      xmax = float(obj['bndbox']['xmax'])
-      ymin = float(obj['bndbox']['ymin'])
-      ymax = float(obj['bndbox']['ymax'])
-    else:
-      xmin = float(np.min(nonzero_x_indices))
-      xmax = float(np.max(nonzero_x_indices))
-      ymin = float(np.min(nonzero_y_indices))
-      ymax = float(np.max(nonzero_y_indices))
+    xmin = float(obj['bndbox']['xmin'])
+    xmax = float(obj['bndbox']['xmax'])
+    ymin = float(obj['bndbox']['ymin'])
+    ymax = float(obj['bndbox']['ymax'])
 
     xmins.append(xmin / width)
     ymins.append(ymin / height)
     xmaxs.append(xmax / width)
     ymaxs.append(ymax / height)
-    class_name = get_class_name_from_filename(data['filename'])
+    class_name = obj['name']
     classes_text.append(class_name.encode('utf8'))
     classes.append(label_map_dict[class_name])
     truncated.append(int(obj['truncated']))
     poses.append(obj['pose'].encode('utf8'))
-    if not faces_only:
-      mask_remapped = (mask_np != 2).astype(np.uint8)
-      masks.append(mask_remapped)
 
   feature_dict = {
       'image/height': dataset_util.int64_feature(height),
@@ -186,21 +144,6 @@ def dict_to_tf_example(data,
       'image/object/truncated': dataset_util.int64_list_feature(truncated),
       'image/object/view': dataset_util.bytes_list_feature(poses),
   }
-  if not faces_only:
-    if mask_type == 'numerical':
-      mask_stack = np.stack(masks).astype(np.float32)
-      masks_flattened = np.reshape(mask_stack, [-1])
-      feature_dict['image/object/mask'] = (
-          dataset_util.float_list_feature(masks_flattened.tolist()))
-    elif mask_type == 'png':
-      encoded_mask_png_list = []
-      for mask in masks:
-        img = PIL.Image.fromarray(mask)
-        output = io.BytesIO()
-        img.save(output, format='PNG')
-        encoded_mask_png_list.append(output.getvalue())
-      feature_dict['image/object/mask'] = (
-          dataset_util.bytes_list_feature(encoded_mask_png_list))
 
   example = tf.train.Example(features=tf.train.Features(feature=feature_dict))
   return example
@@ -210,9 +153,7 @@ def create_tf_record(output_filename,
                      label_map_dict,
                      annotations_dir,
                      image_dir,
-                     examples,
-                     faces_only=True,
-                     mask_type='png'):
+                     examples):
   """Creates a TFRecord file from examples.
 
   Args:
@@ -223,15 +164,12 @@ def create_tf_record(output_filename,
     examples: Examples to parse and save to tf record.
     faces_only: If True, generates bounding boxes for pet faces.  Otherwise
       generates bounding boxes (as well as segmentations for full pet bodies).
-    mask_type: 'numerical' or 'png'. 'png' is recommended because it leads to
-      smaller file sizes.
   """
   writer = tf.python_io.TFRecordWriter(output_filename)
   for idx, example in enumerate(examples):
     if idx % 100 == 0:
       logging.info('On image %d of %d', idx, len(examples))
     xml_path = os.path.join(annotations_dir, 'xmls', example + '.xml')
-    mask_path = os.path.join(annotations_dir, 'trimaps', example + '.png')
 
     if not os.path.exists(xml_path):
       logging.warning('Could not find %s, ignoring example.', xml_path)
@@ -243,12 +181,7 @@ def create_tf_record(output_filename,
 
     try:
       tf_example = dict_to_tf_example(
-          data,
-          mask_path,
-          label_map_dict,
-          image_dir,
-          faces_only=faces_only,
-          mask_type=mask_type)
+          data, label_map_dict, image_dir)
       writer.write(tf_example.SerializeToString())
     except ValueError:
       logging.warning('Invalid example: %s, ignoring.', xml_path)
@@ -280,27 +213,18 @@ def main(_):
 
   train_output_path = os.path.join(FLAGS.output_dir, 'pet_train.record')
   val_output_path = os.path.join(FLAGS.output_dir, 'pet_val.record')
-  if FLAGS.faces_only:
-    train_output_path = os.path.join(FLAGS.output_dir,
-                                     'pet_train_with_masks.record')
-    val_output_path = os.path.join(FLAGS.output_dir,
-                                   'pet_val_with_masks.record')
   create_tf_record(
       train_output_path,
       label_map_dict,
       annotations_dir,
       image_dir,
-      train_examples,
-      faces_only=FLAGS.faces_only,
-      mask_type=FLAGS.mask_type)
+      train_examples)
   create_tf_record(
       val_output_path,
       label_map_dict,
       annotations_dir,
       image_dir,
-      val_examples,
-      faces_only=FLAGS.faces_only,
-      mask_type=FLAGS.mask_type)
+      val_examples)
 
 
 if __name__ == '__main__':
